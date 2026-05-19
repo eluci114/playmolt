@@ -1,0 +1,622 @@
+"""
+engines/battle.py - 4인 서바이벌 배틀 엔진
+
+핵심 패턴:
+  bs = self._bs()       # deepcopy로 현재 상태 복사
+  ... bs 수정 ...
+  self._commit(bs)      # config 전체 교체로 SQLAlchemy에 감지시킴
+"""
+import copy
+import logging
+import random
+import threading
+import time
+from sqlalchemy.orm import Session
+from sqlalchemy.orm.attributes import flag_modified
+
+from app.engines.base import BaseGameEngine
+from app.models.game import Game, GameStatus
+from app.models.agent import Agent
+
+# get_state에서 lazy start 시 한 게임당 한 번만 _setup_agents 실행하도록
+_setup_locks: dict[str, threading.Lock] = {}
+_setup_locks_mutex = threading.Lock()
+# process_action 직렬화: 동시에 4명이 액션 제출 시 최신 pending_actions를 읽고 한 명만 commit 하면 덮어쓰기 방지
+_action_locks: dict[str, threading.Lock] = {}
+_action_locks_mutex = threading.Lock()
+
+
+def _get_setup_lock(game_id: str) -> threading.Lock:
+    with _setup_locks_mutex:
+        if game_id not in _setup_locks:
+            _setup_locks[game_id] = threading.Lock()
+        return _setup_locks[game_id]
+
+
+_logger = logging.getLogger(__name__)
+
+
+def _get_action_lock(game_id: str) -> threading.Lock:
+    with _action_locks_mutex:
+        if game_id not in _action_locks:
+            _action_locks[game_id] = threading.Lock()
+        return _action_locks[game_id]
+
+
+class BattleEngine(BaseGameEngine):
+
+    MAX_AGENTS = 4
+    MAX_ROUNDS = 15
+    # 매칭 완료 후 1라운드 시작 전 대기 시간(초)
+    MATCH_DELAY_SEC = 10
+    # 로그 전용: 프론트엔드가 "이 시간만큼 대기 표시"할 때 쓸 값. 백엔드는 기다리지 않고 즉시 collect.
+    DISPLAY_COUNTDOWN_SEC = 20
+    # collect 단계에서 이 시간(초) 안에 액션 안 낸 생존자는 charge로 처리해 라운드 진행 (외부 에이전트 이탈 대비)
+    COLLECT_TIMEOUT_SEC = 30
+    ROUND_ADVANCE_DELAY_SEC = 2
+    GAS_RANDOM_START = 8
+    GAS_ALL_START = 11
+
+    def __init__(self, game: Game, db: Session):
+        super().__init__(game, db)
+        if "battle_state" not in self.game.config:
+            self._init_battle_state()
+
+    def _init_battle_state(self):
+        self.game.config = {
+            **self.game.config,
+            "battle_state": {
+                "round": 0, "phase": "waiting", "agents": {},
+                "action_order": [], "pending_actions": {}, "all_submitted_at": None,
+                "round_log": [], "history": [],
+            }
+        }
+        flag_modified(self.game, "config")
+        self.db.commit()
+
+    def _commit(self, new_bs: dict, broadcast_bs: dict | None = None):
+        """Persist new_bs. Broadcast broadcast_bs if given, else new_bs (관전용 순차 재생을 위해 round_log 포함 가능)."""
+        self.game.config = {**self.game.config, "battle_state": new_bs}
+        flag_modified(self.game, "config")  # JSON 컬럼 변경 감지 (안 하면 commit 후에도 DB에 반영 안 됨)
+        self.db.commit()
+        from app.core.connection_manager import manager
+        to_broadcast = copy.deepcopy(broadcast_bs) if broadcast_bs is not None else copy.deepcopy(new_bs)
+        for aid, astate in (to_broadcast.get("agents") or {}).items():
+            agent = self.db.query(Agent).filter_by(id=aid).first()
+            astate["name"] = agent.name if agent else aid
+        manager.schedule_broadcast(
+            self.game.id,
+            {"type": "state_update", "battle_state": to_broadcast},
+        )
+
+    def _bs(self) -> dict:
+        return copy.deepcopy(self.game.config["battle_state"])
+
+    def _mark_matched(self):
+        """매칭 완료 처리: status=running, phase=waiting, matched_at 기록. 10초 후 get_state에서 _start_game 호출 시 실제 시작."""
+        super()._start_game()
+        bs = self._bs()
+        bs["phase"] = "waiting"
+        bs["matched_at"] = time.time()
+        self._commit(bs)
+
+    def _start_game(self):
+        bs = self._bs()
+        matched_at = bs.get("matched_at")
+        has_agents = bool(bs.get("agents") and bs.get("action_order"))
+
+        if not has_agents and matched_at is None:
+            self._mark_matched()
+            return
+        if matched_at is not None and time.time() - matched_at < self.MATCH_DELAY_SEC:
+            return
+        if has_agents:
+            return
+        # matched_at 있고 10초 경과 → 실제 게임 시작
+        super()._start_game()
+        self._setup_agents()
+
+    def _setup_agents(self):
+        from app.models.game import GameParticipant
+        participants = self.db.query(GameParticipant).filter_by(game_id=self.game.id).all()
+        agent_ids = [p.agent_id for p in participants]
+        random.shuffle(agent_ids)
+
+        agents = {
+            aid: {"hp": 4, "energy": 0, "defend_streak": 0,
+                  "attack_count": 0, "alive": True, "order": i}
+            for i, aid in enumerate(agent_ids)
+        }
+
+        bs = self._bs()
+        bs["agents"] = agents
+        bs["action_order"] = agent_ids
+        bs["round"] = 1
+        # 리플레이/표시용 로그: 게임 시작 → (프론트는 DISPLAY_COUNTDOWN_SEC 동안 대기 표시) → collect
+        bs.setdefault("history", []).append({
+            "phase": "game_start",
+            "round": 1,
+            "agents": copy.deepcopy(agents),
+            "action_order": list(agent_ids),
+        })
+        bs.setdefault("history", []).append({
+            "phase": "countdown",
+            "round": 1,
+            "display_duration_sec": self.DISPLAY_COUNTDOWN_SEC,
+        })
+        bs["phase"] = "collect"
+        bs["collect_entered_at"] = time.time()
+        bs["all_submitted_at"] = None
+        self._commit(bs)
+
+    def process_action(self, agent: Agent, action: dict) -> dict:
+        if self.game.status != GameStatus.running:
+            return {"success": False, "error": "GAME_NOT_RUNNING"}
+
+        lock = _get_action_lock(self.game.id)
+        delay_then_apply = False
+        delay_sec = 0
+        validated_error = None
+        with lock:
+            # 동시 제출 시 최신 pending_actions를 읽기 위해 DB에서 다시 로드
+            self.db.refresh(self.game)
+            bs = self._bs()
+            agent_state = bs["agents"].get(agent.id)
+            if not agent_state:
+                return {"success": False, "error": "AGENT_NOT_IN_GAME"}
+            if not agent_state["alive"]:
+                return {"success": False, "error": "AGENT_DEAD"}
+            if bs["phase"] != "collect":
+                return {"success": False, "error": "NOT_COLLECTION_PHASE"}
+            if agent.id in bs["pending_actions"]:
+                return {"success": False, "error": "ALREADY_ACTED"}
+
+            validated = self._validate_action(agent.id, action, agent_state, bs)
+            if not validated["success"]:
+                # 잘못된 액션도 charge로 기록해, 한 명의 bad request가 나머지 봇 진행을 막지 않도록 함
+                bs["pending_actions"][agent.id] = {"type": "charge"}
+                validated_error = validated
+            else:
+                bs["pending_actions"][agent.id] = validated["action"]
+
+            alive_agents = [aid for aid, s in bs["agents"].items() if s["alive"]]
+            all_submitted = set(alive_agents) == set(bs["pending_actions"].keys())
+            filled_by_timeout = False
+            if not all_submitted:
+                # collect 타임아웃: 미제출자는 default_action(charge)로 처리해 라운드 진행
+                entered = bs.get("collect_entered_at") or 0
+                if time.time() - entered >= self._collect_timeout_sec():
+                    missing = [aid for aid in alive_agents if aid not in bs["pending_actions"]]
+                    for aid in missing:
+                        bs["pending_actions"][aid] = self.default_action(aid)
+                    _logger.info(
+                        "battle collect timeout game_id=%s round=%s missing default_action agent_ids=%s",
+                        self.game.id,
+                        bs.get("round"),
+                        missing,
+                    )
+                    all_submitted = True
+                    filled_by_timeout = True
+            if all_submitted:
+                bs["all_submitted_at"] = bs.get("all_submitted_at") or time.time()
+            else:
+                bs["all_submitted_at"] = None
+            self._commit(bs)
+
+            if all_submitted:
+                if filled_by_timeout or int(bs.get("round") or 0) <= 1:
+                    self._apply_round()
+                else:
+                    delay_then_apply = True
+                    delay_sec = self._round_advance_delay_sec()
+
+            if validated_error is not None and not delay_then_apply:
+                return validated_error
+        if delay_then_apply:
+            time.sleep(delay_sec)
+            self.try_advance_collect_after_delay()
+        if validated_error is not None:
+            return validated_error
+        return {"success": True, "message": "action accepted"}
+
+    def _collect_timeout_sec(self) -> int:
+        return (self.game.config or {}).get("phase_timeout_seconds", self.COLLECT_TIMEOUT_SEC)
+
+    def _round_advance_delay_sec(self) -> int:
+        return int((self.game.config or {}).get("round_advance_delay_seconds", self.ROUND_ADVANCE_DELAY_SEC))
+
+    def default_action(self, agent_id: str) -> dict:
+        return {"type": "charge"}
+
+    def _maybe_apply_collect_timeout(self) -> bool:
+        """collect 단계에서 타임아웃 시 미제출자에 default_action 주입 후 라운드 적용. 1명 이상 주입 시 True."""
+        if self.game.status != GameStatus.running:
+            return False
+        lock = _get_action_lock(self.game.id)
+        with lock:
+            self.db.refresh(self.game)
+            bs = self._bs()
+            if bs.get("phase") != "collect":
+                return False
+            alive_agents = [aid for aid, s in bs["agents"].items() if s["alive"]]
+            if set(alive_agents) == set(bs.get("pending_actions", {}).keys()):
+                return False
+            entered = bs.get("collect_entered_at") or 0
+            if time.time() - entered < self._collect_timeout_sec():
+                return False
+            missing = [aid for aid in alive_agents if aid not in bs["pending_actions"]]
+            for aid in missing:
+                bs["pending_actions"][aid] = self.default_action(aid)
+            _logger.info("battle collect timeout(get_state) game_id=%s round=%s 미제출 charge 처리 agent_ids=%s", self.game.id, bs.get("round"), missing)
+            bs["all_submitted_at"] = time.time()
+            self._commit(bs)
+            self._apply_round()
+            return len(missing) > 0
+
+    def try_advance_collect_after_delay(self) -> bool:
+        if self.game.status != GameStatus.running:
+            return False
+        lock = _get_action_lock(self.game.id)
+        with lock:
+            self.db.refresh(self.game)
+            bs = self._bs()
+            if bs.get("phase") != "collect":
+                return False
+            alive_agents = [aid for aid, s in bs.get("agents", {}).items() if s.get("alive")]
+            if set(alive_agents) != set((bs.get("pending_actions") or {}).keys()):
+                return False
+            round_num = int(bs.get("round") or 0)
+            if round_num <= 1:
+                self._apply_round()
+                return True
+            submitted_at = bs.get("all_submitted_at")
+            if submitted_at is None:
+                bs["all_submitted_at"] = time.time()
+                self._commit(bs)
+                return False
+            if time.time() - float(submitted_at) < self._round_advance_delay_sec():
+                return False
+            self._apply_round()
+            return True
+
+    def apply_phase_timeout(self) -> bool:
+        timeout_applied = self._maybe_apply_collect_timeout()
+        delayed_advanced = self.try_advance_collect_after_delay()
+        return timeout_applied or delayed_advanced
+
+    def _validate_action(self, agent_id, action, agent_state, bs):
+        action_type = action.get("type")
+        if action_type not in ["attack", "defend", "charge"]:
+            return {"success": True, "action": {"type": "charge"}}
+        if action_type == "defend" and agent_state["defend_streak"] >= 3:
+            return {"success": False, "error": "DEFEND_STREAK_LIMIT"}
+        if action_type == "attack":
+            target_id = action.get("target_id")
+            if not target_id:
+                return {"success": False, "error": "ATTACK_NEEDS_TARGET"}
+            t = bs["agents"].get(target_id)
+            if not t or not t["alive"]:
+                return {"success": False, "error": "INVALID_TARGET"}
+            return {"success": True, "action": {"type": "attack", "target_id": target_id}}
+        return {"success": True, "action": {"type": action_type}}
+
+    def _apply_round(self):
+        bs = self._bs()
+        bs["phase"] = "apply"
+
+        # 이번 라운드 시작 시 살아 있던 에이전트 목록을 기록해 둔다.
+        # 게임이 끝났는데 아무도 살아남지 않은 경우, 이 집합을 기준으로
+        # 공격 횟수가 가장 많은 봇을 최종 승자로 결정한다.
+        bs["last_round_alive_ids"] = [
+            aid for aid, s in bs["agents"].items() if s["alive"]
+        ]
+
+        order = [a for a in bs["action_order"] if bs["agents"][a]["alive"]]
+        defenders = {aid for aid, act in bs["pending_actions"].items() if act["type"] == "defend"}
+
+        for agent_id in order:
+            ag = bs["agents"][agent_id]
+            # re-check: might have died earlier this round
+            if not ag["alive"]:
+                bs["round_log"].append({
+                    "agent_id": agent_id,
+                    "type": "skip",
+                    "reason": "dead_before_action",
+                })
+                continue
+
+            action = bs["pending_actions"].get(agent_id, {"type": "charge"})
+
+            if action["type"] == "charge":
+                ag["energy"] = min(3, ag["energy"] + 1)
+                ag["defend_streak"] = 0
+                bs["round_log"].append({"agent_id": agent_id, "type": "charge", "energy_after": ag["energy"]})
+
+            elif action["type"] == "defend":
+                ag["defend_streak"] += 1
+                bs["round_log"].append({"agent_id": agent_id, "type": "defend", "streak": ag["defend_streak"]})
+
+            elif action["type"] == "attack":
+                tid = action["target_id"]
+                tg = bs["agents"].get(tid)
+                ag["defend_streak"] = 0
+                dmg = 1 + ag["energy"]
+                ag["energy"] = 0
+                ag["attack_count"] += 1
+
+                if not tg or not tg["alive"]:
+                    bs["round_log"].append({"agent_id": agent_id, "type": "attack_invalid", "target_id": tid})
+                elif tid in defenders:
+                    # blocked: no HP change → defender cannot die from this attack
+                    bs["round_log"].append({"agent_id": agent_id, "type": "attack_blocked", "target_id": tid, "damage": dmg})
+                else:
+                    tg["hp"] -= dmg
+                    bs["round_log"].append({"agent_id": agent_id, "type": "attack_hit", "target_id": tid, "damage": dmg, "target_hp_after": tg["hp"]})
+                    if tg["hp"] <= 0:
+                        tg["alive"] = False
+                        tg["hp"] = 0
+                        bs["round_log"].append({"type": "death", "agent_id": tid})
+
+        # deaths handled inline above; _process_deaths only used in _apply_gas
+        bs = self._apply_gas(bs)
+
+        alive = [(aid, s) for aid, s in bs["agents"].items() if s["alive"]]
+        game_over = len(alive) <= 1 or bs["round"] >= self.MAX_ROUNDS
+
+        if game_over:
+            # 아무도 살아남지 않은 경우: 마지막 라운드 시작 시 살아 있던 봇들 중
+            # 공격 횟수가 가장 많았던 봇을 최종 승자로 선택한다.
+            if len(alive) == 0:
+                candidate_ids = bs.get("last_round_alive_ids") or []
+                if not candidate_ids:
+                    candidate_ids = list(bs["agents"].keys())
+                candidate_ids = [aid for aid in candidate_ids if aid in bs["agents"]]
+                if candidate_ids:
+                    max_atk = max(bs["agents"][aid]["attack_count"] for aid in candidate_ids)
+                    winner_ids = [
+                        aid for aid in candidate_ids
+                        if bs["agents"][aid]["attack_count"] == max_atk
+                    ]
+                    winner_id = random.choice(winner_ids)
+                    bs["agents"][winner_id]["alive"] = True
+                    if bs["agents"][winner_id]["hp"] <= 0:
+                        bs["agents"][winner_id]["hp"] = 1
+                    bs["round_log"].append({
+                        "type": "final_winner_by_attack_count",
+                        "agent_id": winner_id,
+                        "attack_count": max_atk,
+                        "candidates": candidate_ids,
+                        "reason": "no_survivor_in_final_round",
+                    })
+
+        # 리플레이용: 모든 round_log 반영 후 한 번만 history에 추가
+        bs["history"].append({"round": bs["round"], "log": list(bs["round_log"])})
+
+        if game_over:
+            bs["phase"] = "end"
+            self._commit(bs)
+            self.finish()
+        else:
+            # 관전용: 브로드캐스트에는 방금 끝난 라운드의 round_log 포함 (프론트 순차 재생용)
+            round_log_for_broadcast = list(bs["round_log"])
+            bs["round"] += 1
+            bs["pending_actions"] = {}
+            bs["all_submitted_at"] = None
+            bs["round_log"] = []
+            bs.setdefault("history", []).append({
+                "phase": "countdown",
+                "round": bs["round"],
+                "display_duration_sec": self.DISPLAY_COUNTDOWN_SEC,
+            })
+            bs["phase"] = "collect"
+            bs["collect_entered_at"] = time.time()
+            alive_order = [a for a in bs["action_order"] if bs["agents"][a]["alive"]]
+            if alive_order:
+                bs["action_order"] = alive_order[1:] + [alive_order[0]]
+            broadcast_bs = copy.deepcopy(bs)
+            broadcast_bs["round_log"] = round_log_for_broadcast
+            self._commit(bs, broadcast_bs=broadcast_bs)
+            # 라운드 종료 이벤트 (방금 끝난 라운드 기준)
+            from app.core.connection_manager import manager
+            ended_round = bs["round"] - 1
+            last_history = bs["history"][-1] if bs["history"] else {}
+            manager.schedule_broadcast(
+                self.game.id,
+                {
+                    "type": "round_end",
+                    "round": ended_round,
+                    "log": last_history.get("log", []),
+                    "agents": bs["agents"],
+                },
+            )
+
+    def _process_deaths(self, bs):
+        """
+        라운드/가스 적용 중 HP 가 0 이하가 된 봇들을 모두 죽은 상태로 만든다.
+        동시 패배 시 생존 룰은 더 이상 라운드 단위에서 사용하지 않고,
+        게임 종료 시점에만 last_round_alive_ids / attack_count 를 기준으로
+        최종 승자를 결정한다.
+        """
+        dead = [(aid, s) for aid, s in bs["agents"].items() if s["alive"] and s["hp"] <= 0]
+        if not dead:
+            return bs
+        for aid, _ in dead:
+            bs["agents"][aid]["alive"] = False
+            bs["agents"][aid]["hp"] = 0
+            bs["round_log"].append({"type": "death", "agent_id": aid})
+        return bs
+
+    def _apply_gas(self, bs):
+        rnd = bs["round"]
+        alive = [(aid, s) for aid, s in bs["agents"].items() if s["alive"]]
+        if not alive:
+            return bs
+        # 1명만 살아있으면 가스 미발동 (승자 확정 직전 라운드에서 가스로 죽는 것 방지)
+        if len(alive) <= 1:
+            return bs
+        if rnd >= self.GAS_ALL_START:
+            for aid, _ in alive:
+                bs["agents"][aid]["hp"] -= 1
+                bs["round_log"].append({"type": "gas_all", "agent_id": aid, "hp_after": bs["agents"][aid]["hp"]})
+            bs = self._process_deaths(bs)
+        elif rnd >= self.GAS_RANDOM_START:
+            victim_id, _ = random.choice(alive)
+            bs["agents"][victim_id]["hp"] -= 1
+            bs["round_log"].append({"type": "gas_random", "agent_id": victim_id, "hp_after": bs["agents"][victim_id]["hp"]})
+            bs = self._process_deaths(bs)
+        return bs
+
+    def get_state(self, agent: Agent) -> dict:
+        # 다른 요청에서 commit한 라운드 진행 반영을 위해 항상 DB에서 최신 상태 로드
+        self.db.refresh(self.game)
+        bs = self.game.config.get("battle_state") or {}
+        # collect 타임아웃: state만 폴링하는 봇이 있어도 미제출자 charge 처리 후 라운드 진행
+        if self.game.status == GameStatus.running and bs.get("phase") == "collect":
+            self._maybe_apply_collect_timeout()
+            self.try_advance_collect_after_delay()
+            self.db.refresh(self.game)
+            bs = self.game.config.get("battle_state") or {}
+        from app.models.game import GameParticipant
+        participants = self.db.query(GameParticipant).filter_by(game_id=self.game.id).all()
+        # 4명 찼는데 아직 대기 중이면(방 합치기 등으로 늦게 모인 경우) 여기서 게임 시작
+        if self.game.status == GameStatus.waiting and len(participants) >= self.MAX_AGENTS:
+            lock = _get_setup_lock(self.game.id)
+            with lock:
+                self.db.refresh(self.game)
+                participants = self.db.query(GameParticipant).filter_by(game_id=self.game.id).all()
+                if len(participants) >= self.MAX_AGENTS and self.game.status == GameStatus.waiting:
+                    self._start_game()
+            bs = self.game.config.get("battle_state") or {}
+        # 게임은 이미 running인데 phase가 아직 waiting이면: matched_at 10초 경과 시 _start_game() 호출
+        elif (
+            self.game.status == GameStatus.running
+            and bs.get("phase") == "waiting"
+            and (not bs.get("agents") or not bs.get("action_order"))
+        ):
+            lock = _get_setup_lock(self.game.id)
+            with lock:
+                self.db.refresh(self.game)
+                bs = self.game.config.get("battle_state") or {}
+                if bs.get("phase") == "waiting" and (not bs.get("agents") or not bs.get("action_order")):
+                    participants = self.db.query(GameParticipant).filter_by(game_id=self.game.id).all()
+                    if len(participants) >= self.MAX_AGENTS:
+                        matched_at = bs.get("matched_at")
+                        if matched_at is not None and time.time() - matched_at >= self.MATCH_DELAY_SEC:
+                            self._start_game()
+                bs = self.game.config.get("battle_state") or {}
+
+        ag = bs.get("agents", {}).get(agent.id, {})
+
+        other_agents = []
+        for aid, s in bs.get("agents", {}).items():
+            if aid != agent.id:
+                oa = self.db.query(Agent).filter_by(id=aid).first()
+                other_agents.append({
+                    "id": aid, "name": oa.name if oa else aid,
+                    "hp": s["hp"], "energy": s["energy"],
+                    "alive": s["alive"], "attack_count": s["attack_count"],
+                })
+
+        allowed = ["attack"]
+        if ag.get("energy", 0) < 3:
+            allowed.append("charge")
+        if ag.get("defend_streak", 0) < 3:
+            allowed.append("defend")
+
+        action_order = bs.get("action_order", [])
+        history = bs.get("history", [])
+        round_num = bs.get("round", 0)
+        phase = bs.get("phase", "waiting")
+        matched_at = bs.get("matched_at")
+        countdown_sec_remaining = None
+        if phase == "waiting" and matched_at is not None:
+            elapsed = time.time() - matched_at
+            countdown_sec_remaining = max(0, int(self.MATCH_DELAY_SEC - elapsed))
+
+        # 에이전트가 아직 battle_state에 없으면(대기 중) isAlive 기본 True
+        is_alive = ag.get("alive", True) if ag else True
+        agents_map = bs.get("agents", {})
+        current_turn_agent_id = action_order[0] if action_order else None
+        turn_order_display = [
+            {
+                "position": i + 1,
+                "agent_id": aid,
+                "is_current": i == 0,
+                "alive": agents_map.get(aid, {}).get("alive", False),
+            }
+            for i, aid in enumerate(action_order)
+            if agents_map.get(aid, {}).get("alive", False)
+        ]
+        out = {
+            "gameStatus": self.game.status.value,
+            "gameType": "battle",
+            "round": round_num,
+            "maxRounds": self.MAX_ROUNDS,
+            "phase": phase,
+            "action_order": action_order,
+            "current_turn_agent_id": current_turn_agent_id,
+            "turn_order_display": turn_order_display,
+            "my_position": action_order.index(agent.id) if agent.id in action_order else -1,
+            "self": {
+                "id": agent.id, "name": agent.name,
+                "hp": ag.get("hp", 0), "energy": ag.get("energy", 0),
+                "defend_streak": ag.get("defend_streak", 0),
+                "attack_count": ag.get("attack_count", 0),
+                "isAlive": is_alive,
+            },
+            "other_agents": other_agents,
+            "allowed_actions": allowed,
+            "last_round": history[-1] if history else None,
+            "gas_info": self._get_gas_info(round_num),
+            "result": self._get_result(agent.id) if phase == "end" else None,
+        }
+        if countdown_sec_remaining is not None:
+            out["countdown_sec_remaining"] = countdown_sec_remaining
+            out["matched_at"] = matched_at
+        return out
+
+    def _get_gas_info(self, rnd):
+        if rnd < self.GAS_RANDOM_START:
+            return {"status": "safe", "rounds_until_gas": self.GAS_RANDOM_START - rnd}
+        elif rnd < self.GAS_ALL_START:
+            return {"status": "random_gas", "rounds_until_all_gas": self.GAS_ALL_START - rnd}
+        return {"status": "all_gas"}
+
+    def _get_result(self, agent_id):
+        bs = self.game.config["battle_state"]
+        ag = bs["agents"].get(agent_id, {})
+        alive = [aid for aid, s in bs["agents"].items() if s["alive"]]
+        from app.models.game import GameParticipant
+        p = self.db.query(GameParticipant).filter_by(game_id=self.game.id, agent_id=agent_id).first()
+        # 생존 1명이면 그 에이전트가 승자. 전원 사망(가스 등) 시에는 calculate_results에서 정한 rank 1이 승자이므로 DB 결과 사용
+        is_winner = (agent_id in alive and len(alive) == 1) or (p and getattr(p, "result", None) == "win")
+        return {
+            "isWinner": is_winner,
+            "isAlive": ag.get("alive", False),
+            "points": p.points_earned if p else 0,
+        }
+
+    def check_game_end(self) -> bool:
+        bs = self.game.config["battle_state"]
+        alive = [s for s in bs["agents"].values() if s["alive"]]
+        return len(alive) <= 1 or bs["round"] >= self.MAX_ROUNDS
+
+    def calculate_results(self) -> list[dict]:
+        bs = self.game.config["battle_state"]
+        alive = [(aid, s) for aid, s in bs["agents"].items() if s["alive"]]
+        dead = [(aid, s) for aid, s in bs["agents"].items() if not s["alive"]]
+
+        if len(alive) == 1:
+            winner_id = alive[0][0]
+        elif alive:
+            max_atk = max(s["attack_count"] for _, s in alive)
+            winner_id = random.choice([aid for aid, s in alive if s["attack_count"] == max_atk])
+        else:
+            max_atk = max(s["attack_count"] for s in bs["agents"].values())
+            winner_id = random.choice([aid for aid, s in bs["agents"].items() if s["attack_count"] == max_atk])
+
+        # coin 규칙: 1위 60점, 그 외 0점
+        results = [{"agent_id": winner_id, "rank": 1, "points": 60}]
+        for rank, (aid, _) in enumerate(reversed(dead), start=2):
+            results.append({"agent_id": aid, "rank": rank, "points": 0})
+        return results
